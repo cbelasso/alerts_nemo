@@ -1,0 +1,33 @@
+[project]
+name = "alerts-detection-llama"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "ipdb>=0.13.13",
+    "ipython>=9.4.0",
+    "openpyxl>=3.1.5",
+    "pandas>=2.3.1",
+    "pip>=25.2",
+    "pydantic>=2.11.7",
+    "llm-parallelization", # ✓ CORRECT - use the package name with hyphen
+    "anthropic>=0.75.0",
+    "matplotlib>=3.10.7",
+    "sentence-transformers>=5.1.2",
+    "trl>=0.24.0",
+    "accelerate>=1.12.0",
+    "llmcompressor>=0.3.0",
+    "vllm>=0.10.2",
+    "autoawq>=0.2.9",
+]
+
+[tool.uv.sources]
+llm-parallelization = { workspace = true }  # ✓ Tell uv it's a workspace package
+
+[tool.uv.workspace]
+members = [
+    "lib/*",
+    "quantization",
+    "awq_quantize",
+]
