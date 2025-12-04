@@ -100,9 +100,11 @@ def load_llm(**llm_kwargs) -> LLM:
         model=llm_kwargs["model_path"],
         trust_remote_code=True,
         enforce_eager=True,
+        tokenizer=llm_kwargs.get("tokenizer"),  # ADD THIS LINE
         gpu_memory_utilization=llm_kwargs.get("gpu_memory_utilization", 0.9),
         max_model_len=llm_kwargs.get("max_model_len", None),
         dtype=llm_kwargs.get("dtype", "auto"),
+        enable_chunked_prefill=True,  # Enable continuous batching
         # Add more args here if needed
     )
 
@@ -146,6 +148,7 @@ class LLMProcessor:
         gpu_memory_utilization: float = 0.4,
         max_model_len: int | None = 1024,
         parser: Optional[CharacterLevelParser] | None = None,
+        tokenizer: str | None = None,  # <-- ADD THIS LINE
         **extra_llm_args,
     ):
         self.gpu_list = gpu_list
@@ -155,7 +158,6 @@ class LLMProcessor:
         self.gpu_memory_utilization = gpu_memory_utilization
         self.max_model_len = max_model_len
         self.parser = parser
-        self.tokenizer = AutoTokenizer.from_pretrained(self.llm)
         self.task_queue: Queue = Queue()
         self.response_queue: Queue = Queue()
         self.load_signal_queue: Queue = Queue()
@@ -164,6 +166,9 @@ class LLMProcessor:
         self.responses = []
         self.num_gpus = len(gpu_list)
 
+        tokenizer_path = tokenizer or self.llm
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+
         # Assemble LLM initialization arguments
         self.llm_kwargs = {
             "model_path": self.llm,
@@ -171,6 +176,12 @@ class LLMProcessor:
             "gpu_memory_utilization": gpu_memory_utilization,
             **extra_llm_args,
         }
+
+        # ✅ ADD THIS SECTION
+        # Pass tokenizer to vLLM if specified separately
+        if tokenizer is not None:
+            self.llm_kwargs["tokenizer"] = tokenizer
+
         self.prepare_processes()
 
     def prepare_processes(self) -> None:
