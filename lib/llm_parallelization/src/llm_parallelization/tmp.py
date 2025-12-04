@@ -35,6 +35,11 @@ class NewProcessor:
         max_model_len: int = 2048,
         default_guided_config: Optional[Dict] = None,
         tokenizer: str | None = None,
+        tokenizer_mode: str = "auto",
+        config_format: str | None = None,
+        load_format: str | None = None,
+        tensor_parallel_size: int = 1,
+        skip_tokenizer_init: bool = False,
         _worker_mode: bool = False,
         **extra_llm_args,
     ):
@@ -42,28 +47,44 @@ class NewProcessor:
         self.default_guided_config = default_guided_config or {}
         self.gpu_memory_utilization = gpu_memory_utilization
         self.max_model_len = max_model_len
+        self.tensor_parallel_size = tensor_parallel_size
+        self.skip_tokenizer_init = skip_tokenizer_init
 
         self.llm_kwargs = {
             "model_path": self.llm,
             "max_model_len": max_model_len,
             "gpu_memory_utilization": gpu_memory_utilization,
+            "tokenizer_mode": tokenizer_mode,
+            "tensor_parallel_size": tensor_parallel_size,
             **extra_llm_args,
         }
 
         if tokenizer is not None:
             self.llm_kwargs["tokenizer"] = tokenizer
+        if config_format is not None:
+            self.llm_kwargs["config_format"] = config_format
+        if load_format is not None:
+            self.llm_kwargs["load_format"] = load_format
 
         if _worker_mode:
             self.model = self._load_llm(**self.llm_kwargs)
             self.base_sampling_params = self._get_sampling_params()
+
         else:
             self.gpu_list = gpu_list
             self.multiplicity = multiplicity
             self.use_tqdm = use_tqdm
             self.num_gpus = len(gpu_list)
 
-            tokenizer_path = tokenizer or self.llm
-            self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+            self.tokenizer = None
+            if not skip_tokenizer_init:
+                try:
+                    tokenizer_path = tokenizer or self.llm
+                    self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+                    print(f"✓ External tokenizer loaded: {tokenizer_path}")
+                except Exception as e:
+                    print(f"⚠ Could not load external tokenizer: {e}")
+                    print("  Will rely on vLLM's internal tokenizer for chat formatting")
 
             self.task_queue: Queue = Queue()
             self.response_queue: Queue = Queue()
@@ -77,15 +98,29 @@ class NewProcessor:
             print("🔄 NewProcessor initialized - ready for runtime schema switching")
 
     def _load_llm(self, **llm_kwargs) -> LLM:
-        return LLM(
-            model=llm_kwargs["model_path"],
-            tokenizer=llm_kwargs.get("tokenizer"),
-            trust_remote_code=True,
-            enforce_eager=True,
-            gpu_memory_utilization=llm_kwargs.get("gpu_memory_utilization", 0.9),
-            max_model_len=llm_kwargs.get("max_model_len", None),
-            dtype=llm_kwargs.get("dtype", "auto"),
-        )
+        init_kwargs = {
+            "model": llm_kwargs["model_path"],
+            "trust_remote_code": True,
+            "enforce_eager": llm_kwargs.get("enforce_eager", True),
+            "gpu_memory_utilization": llm_kwargs.get("gpu_memory_utilization", 0.9),
+            "max_model_len": llm_kwargs.get("max_model_len", None),
+            "dtype": llm_kwargs.get("dtype", "auto"),
+        }
+
+        handled_params = {
+            "model_path",
+            "gpu_num",
+            "enforce_eager",
+            "gpu_memory_utilization",
+            "max_model_len",
+            "dtype",
+        }
+
+        for key, value in llm_kwargs.items():
+            if key not in handled_params and value is not None:
+                init_kwargs[key] = value
+
+        return LLM(**init_kwargs)
 
     def _get_sampling_params(self) -> SamplingParams:
         return SamplingParams(
@@ -143,11 +178,26 @@ class NewProcessor:
         )
 
     def format_prompt(self, prompt: str) -> str:
-        return self.tokenizer.apply_chat_template(
-            [{"role": "user", "content": prompt}],
-            add_generation_prompt=True,
-            tokenize=False,
-        )
+        """
+        Format prompt using tokenizer chat template.
+
+        If external tokenizer is not available, returns the prompt as-is.
+        For models like Mistral, you should pre-format prompts before passing them in.
+        """
+        if self.tokenizer is None:
+            # No external tokenizer - return prompt as-is
+            return prompt
+
+        try:
+            return self.tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt}],
+                add_generation_prompt=True,
+                tokenize=False,
+            )
+        except Exception as e:
+            print(f"⚠ Chat template formatting failed: {e}")
+            print("  Returning prompt as-is")
+            return prompt
 
     def create_batches(self, prompts: list, batch_size: int) -> list:
         return [prompts[i : i + batch_size] for i in range(0, len(prompts), batch_size)]
