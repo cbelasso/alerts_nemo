@@ -1,199 +1,396 @@
 """
-Standalone Inference Script for Fine-Tuned Alerts Classifier
+OPTIMIZED Multi-GPU QLoRA Fine-Tuning Script
 
-Use this to test your fine-tuned model after training.
-IMPORTANT: Match the prompt format used during training!
+Designed for large datasets (50K+ samples) with multiple GPUs.
+
+Key optimizations:
+- Multi-GPU training with Accelerate
+- Larger batch sizes
+- Flash Attention 2
+- Gradient checkpointing
+- 1 epoch (sufficient for large datasets)
+
+Usage:
+    # Single command (uses all available GPUs)
+    accelerate launch --multi_gpu finetune_optimized.py
+
+    # Or specify GPUs
+    CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 accelerate launch --multi_gpu finetune_optimized.py
 """
 
+from datetime import datetime
 import json
-import re
+from pathlib import Path
 
-from peft import PeftModel
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-
-# =============================================================================
-# Configuration - UPDATE THESE PATHS
-# =============================================================================
-# For checkpoints (LoRA adapter), use CHECKPOINT_PATH
-# For merged models, use MERGED_MODEL_PATH
-
-CHECKPOINT_PATH = (
-    "/data-fast/data3/clyde/fine_tuning/alert_models/alerts-nemo-minimal-lora/checkpoint-2400"
+from datasets import Dataset
+from peft import (
+    LoraConfig,
+    TaskType,
+    get_peft_model,
+    prepare_model_for_kbit_training,
 )
-MERGED_MODEL_PATH = None  # Set this if using a merged model instead
+import torch
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    BitsAndBytesConfig,
+    DataCollatorForSeq2Seq,
+    Trainer,
+    TrainingArguments,
+)
 
-BASE_MODEL = "mistralai/Mistral-Nemo-Instruct-2407"
-
-# Set to True if you trained with zero prompt (no system prompt)
-ZERO_PROMPT = True
+# =============================================================================
+# Configuration - OPTIMIZED FOR SPEED
+# =============================================================================
+CONFIG = {
+    # Paths - UPDATE THESE
+    "training_data_path": "/home/clyde/workspace/alerts_detection_llama/scripts/finetuning/training_data/alerts_training_20251202_224001.jsonl",
+    "output_dir": "/home/clyde/workspace/alerts_detection_llama/models/alerts-nemo-minimal-lora_2",
+    "merged_output_dir": "/home/clyde/workspace/alerts_detection_llama/models/alerts-nemo-minimal-merged_2",
+    # Model
+    "base_model": "mistralai/Mistral-Nemo-Instruct-2407",
+    "max_seq_length": 2048,  # Reduced from 4096 - most alerts are short
+    # LoRA - slightly reduced for speed
+    "lora_r": 16,  # Reduced from 32
+    "lora_alpha": 16,
+    "lora_dropout": 0.05,
+    # Training - OPTIMIZED
+    "num_train_epochs": 1,  # 1 epoch is enough for large datasets
+    "per_device_train_batch_size": 8,  # Increased from 4
+    "gradient_accumulation_steps": 2,  # Reduced - with 8 GPUs, effective = 8*8*2 = 128
+    "learning_rate": 2e-4,
+    "warmup_ratio": 0.03,  # Use ratio instead of steps
+    "weight_decay": 0.01,
+    # Logging - less frequent for speed
+    "logging_steps": 25,
+    "save_steps": 200,
+    "eval_steps": 200,
+    # Validation
+    "val_split": 0.02,  # 2% validation
+    # SAMPLE SIZE - Set to limit training data
+    "max_train_samples": 50000,  # Use 25K samples (plenty for good results!)
+}
 
 
 # =============================================================================
-# Load Model
+# Data Loading
 # =============================================================================
-def load_model():
-    """Load the fine-tuned model."""
+def load_training_data(path: str, max_samples: int = None) -> list:
+    """Load training data from JSONL file."""
+    import os
+    import random
 
-    # 4-bit quantization for inference
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    is_main = local_rank == 0
+
+    data = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                data.append(json.loads(line))
+
+    if is_main:
+        print(f"📂 Total examples in file: {len(data)}")
+
+    # Shuffle and sample if max_samples specified
+    if max_samples and len(data) > max_samples:
+        random.seed(42)  # Reproducible sampling
+        random.shuffle(data)
+        data = data[:max_samples]
+        if is_main:
+            print(f"📊 Sampled {max_samples} examples (shuffled)")
+
+    if is_main:
+        print(f"✅ Using {len(data)} training examples")
+    return data
+
+
+def format_minimal(examples: list) -> Dataset:
+    """Format with zero prompting."""
+    formatted_texts = []
+    for ex in examples:
+        text = f"<s>[INST] {ex['input']} [/INST]{ex['output']}</s>"
+        formatted_texts.append({"text": text})
+    return Dataset.from_list(formatted_texts)
+
+
+# =============================================================================
+# Model Setup
+# =============================================================================
+def setup_model(config: dict):
+    """Load model optimized for multi-GPU training."""
+    import os
+
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    is_main = local_rank == 0
+
+    if is_main:
+        print(f"\n🔧 Loading model: {config['base_model']}")
+
+    # 4-bit quantization
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
         bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_use_double_quant=True,
     )
 
-    # Load tokenizer from base model
-    tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL)
+    # Tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(config["base_model"])
     tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right"
 
-    if CHECKPOINT_PATH and not MERGED_MODEL_PATH:
-        # Load base model + LoRA adapter (for checkpoints)
-        print(f"📂 Loading base model: {BASE_MODEL}")
-        base_model = AutoModelForCausalLM.from_pretrained(
-            BASE_MODEL,
-            quantization_config=bnb_config,
-            device_map="auto",
-            torch_dtype=torch.bfloat16,
-        )
+    # Model kwargs - NO flash attention (requires separate install)
+    model_kwargs = {
+        "quantization_config": bnb_config,
+        "torch_dtype": torch.bfloat16,
+        "trust_remote_code": True,
+        "device_map": {"": local_rank},  # Load to current GPU
+    }
 
-        print(f"📂 Loading LoRA adapter from: {CHECKPOINT_PATH}")
-        model = PeftModel.from_pretrained(base_model, CHECKPOINT_PATH)
+    if is_main:
+        print(f"📍 Loading model to GPU {local_rank}")
 
-    else:
-        # Load merged model directly
-        print(f"📂 Loading merged model from: {MERGED_MODEL_PATH}")
-        model = AutoModelForCausalLM.from_pretrained(
-            MERGED_MODEL_PATH,
-            quantization_config=bnb_config,
-            device_map="auto",
-            torch_dtype=torch.bfloat16,
-        )
+    model = AutoModelForCausalLM.from_pretrained(
+        config["base_model"],
+        **model_kwargs,
+    )
 
-    model.eval()
-    print("✅ Model loaded!")
+    # Prepare for training
+    model = prepare_model_for_kbit_training(model)
+
+    # LoRA
+    if is_main:
+        print("🔧 Adding LoRA adapters...")
+
+    lora_config = LoraConfig(
+        r=config["lora_r"],
+        lora_alpha=config["lora_alpha"],
+        lora_dropout=config["lora_dropout"],
+        target_modules=[
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        ],
+        bias="none",
+        task_type=TaskType.CAUSAL_LM,
+    )
+
+    model = get_peft_model(model, lora_config)
+
+    if is_main:
+        model.print_trainable_parameters()
+
     return model, tokenizer
 
 
 # =============================================================================
-# Inference
+# Training
 # =============================================================================
-def classify_text(text: str, model, tokenizer) -> dict:
-    """Classify a single text and return the parsed result."""
+def train(config: dict):
+    """Main training function - optimized for multi-GPU."""
+    import os
 
-    # Build prompt - MUST MATCH TRAINING FORMAT
-    if ZERO_PROMPT:
-        # Zero-prompt format (what you trained with)
-        prompt = f"<s>[INST] {text} [/INST]"
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    is_main = local_rank == 0
+
+    if is_main:
+        print("=" * 60)
+        print("OPTIMIZED MULTI-GPU FINE-TUNING")
+        print("=" * 60)
+
+    # Check GPU count
+    gpu_count = torch.cuda.device_count()
+    if is_main:
+        print(f"\n🖥️  Available GPUs: {gpu_count}")
+
+    # Load data
+    if is_main:
+        print(f"\n📂 Loading: {config['training_data_path']}")
+
+    raw_data = load_training_data(
+        config["training_data_path"],
+        max_samples=config.get("max_train_samples"),
+    )
+
+    # Setup model
+    model, tokenizer = setup_model(config)
+
+    # Format data
+    if is_main:
+        print("\n📝 Formatting data...")
+    dataset = format_minimal(raw_data)
+
+    # Split
+    if config["val_split"] > 0:
+        split = dataset.train_test_split(test_size=config["val_split"], seed=42)
+        train_dataset = split["train"]
+        eval_dataset = split["test"]
+        if is_main:
+            print(f"   Train: {len(train_dataset)}, Val: {len(eval_dataset)}")
     else:
-        # With system prompt
-        system = "You are a workplace alerts classifier. Analyze the input and return JSON with alerts detected."
-        prompt = f"<s>[INST] {system}\n\nComment:\n{text} [/INST]"
+        train_dataset = dataset
+        eval_dataset = None
 
-    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    # Pre-tokenize
+    if is_main:
+        print("\n🔧 Pre-tokenizing...")
 
-    with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=512,
-            temperature=0.1,
-            do_sample=True,
-            pad_token_id=tokenizer.eos_token_id,
+    def tokenize_function(examples):
+        tokenized = tokenizer(
+            examples["text"],
+            truncation=True,
+            max_length=config["max_seq_length"],
+            padding=False,
+        )
+        tokenized["labels"] = tokenized["input_ids"].copy()
+        return tokenized
+
+    train_dataset = train_dataset.map(
+        tokenize_function,
+        batched=True,
+        remove_columns=["text"],
+        num_proc=4,  # Parallel tokenization
+        desc="Tokenizing train" if is_main else None,
+    )
+
+    if eval_dataset:
+        eval_dataset = eval_dataset.map(
+            tokenize_function,
+            batched=True,
+            remove_columns=["text"],
+            num_proc=2,
+            desc="Tokenizing eval" if is_main else None,
         )
 
-    # Decode WITHOUT skipping special tokens first to find [/INST]
-    response_with_special = tokenizer.decode(outputs[0], skip_special_tokens=False)
+    # Output dir
+    output_dir = Path(config["output_dir"])
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Extract everything after [/INST]
-    if "[/INST]" in response_with_special:
-        json_part = response_with_special.split("[/INST]")[-1].strip()
-        # Remove any trailing </s>
-        json_part = json_part.replace("</s>", "").strip()
-    else:
-        # Fallback: try to find JSON in the response
-        response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        json_part = response
+    # Calculate steps
+    total_samples = len(train_dataset)
+    effective_batch = (
+        config["per_device_train_batch_size"]
+        * config["gradient_accumulation_steps"]
+        * gpu_count
+    )
+    steps_per_epoch = total_samples // effective_batch
+    total_steps = steps_per_epoch * config["num_train_epochs"]
 
-    # Try to extract JSON from the response
-    # Sometimes there might be extra text, so find the JSON object
-    json_match = re.search(r"\{.*\}", json_part, re.DOTALL)
-    if json_match:
-        json_str = json_match.group()
-        try:
-            return json.loads(json_str)
-        except json.JSONDecodeError:
-            pass
+    if is_main:
+        print("\n📊 Training stats:")
+        print(f"   Total samples: {total_samples}")
+        print(f"   Per-device batch: {config['per_device_train_batch_size']}")
+        print(f"   Gradient accumulation: {config['gradient_accumulation_steps']}")
+        print(f"   GPUs: {gpu_count}")
+        print(f"   Effective batch size: {effective_batch}")
+        print(f"   Steps per epoch: {steps_per_epoch}")
+        print(f"   Total steps: {total_steps}")
+        print(f"   Epochs: {config['num_train_epochs']}")
 
-    # If regex failed, try direct parse
-    try:
-        return json.loads(json_part)
-    except json.JSONDecodeError:
-        return {"error": "Failed to parse JSON", "raw_response": json_part[:500]}
+    # Training args - optimized
+    training_args = TrainingArguments(
+        output_dir=str(output_dir),
+        num_train_epochs=config["num_train_epochs"],
+        per_device_train_batch_size=config["per_device_train_batch_size"],
+        per_device_eval_batch_size=config["per_device_train_batch_size"],
+        gradient_accumulation_steps=config["gradient_accumulation_steps"],
+        learning_rate=config["learning_rate"],
+        warmup_ratio=config["warmup_ratio"],
+        weight_decay=config["weight_decay"],
+        lr_scheduler_type="cosine",
+        logging_steps=config["logging_steps"],
+        save_steps=config["save_steps"],
+        save_total_limit=2,  # Only keep 2 checkpoints
+        eval_strategy="steps" if eval_dataset else "no",
+        eval_steps=config["eval_steps"] if eval_dataset else None,
+        load_best_model_at_end=False,
+        fp16=False,
+        bf16=torch.cuda.is_bf16_supported(),
+        optim="paged_adamw_8bit",
+        seed=42,
+        report_to="none",
+        gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
+        # Multi-GPU settings
+        ddp_find_unused_parameters=False,
+        dataloader_num_workers=4,
+        dataloader_pin_memory=True,
+    )
 
+    # Data collator
+    data_collator = DataCollatorForSeq2Seq(
+        tokenizer=tokenizer,
+        padding=True,
+        return_tensors="pt",
+    )
 
-def run_tests(model, tokenizer):
-    """Run test cases."""
-    test_cases = [
-        "He called me a fucking chink in front of everyone",
-        "The new software update is buggy and crashes frequently",
-        "Ever since I filed that complaint, I've been excluded from all important meetings",
-        "Great benefits, but my manager said I'd advance faster if I was 'more friendly' with him",
-        "I don't see the point anymore. Everything feels hopeless.",
-        "The coffee machine is broken again",
-        "My supervisor keeps making comments about how women shouldn't be in engineering",
-    ]
+    # Trainer
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        data_collator=data_collator,
+    )
 
-    print("\n" + "=" * 60)
-    print("INFERENCE TEST")
-    print(f"Prompt format: {'Zero prompt' if ZERO_PROMPT else 'With system prompt'}")
-    print("=" * 60)
+    # Estimate time
+    estimated_seconds_per_step = 1.5  # Rough estimate with optimizations
+    estimated_hours = (total_steps * estimated_seconds_per_step) / 3600
 
-    for i, text in enumerate(test_cases, 1):
-        print(f"\n{'─' * 50}")
-        print(f"Test {i}")
-        print(f"{'─' * 50}")
-        print(f"Input: {text[:80]}...")
+    if is_main:
+        print("\n🚀 Starting training...")
+        print(f"   Estimated time: ~{estimated_hours:.1f} hours")
+        print()
 
-        result = classify_text(text, model, tokenizer)
+    start = datetime.now()
+    trainer.train()
+    elapsed = datetime.now() - start
 
-        if "error" in result:
-            print(f"❌ Error: {result['error']}")
-            print(f"   Raw: {result.get('raw_response', '')[:300]}")
-        else:
-            has_alerts = result.get("has_alerts")
-            print(f"✅ has_alerts: {has_alerts}")
+    if is_main:
+        print(f"\n✅ Training completed in {elapsed}")
 
-            if has_alerts and result.get("alerts"):
-                for alert in result["alerts"][:3]:
-                    print(f"   └─ {alert.get('alert_type')} ({alert.get('severity')})")
-                    excerpt = alert.get("excerpt", "")[:50]
-                    print(f"      Excerpt: {excerpt}")
-            elif not has_alerts:
-                classification = result.get("non_alert_classification", "N/A")
-                print(f"   └─ Classification: {classification}")
+    # Save only from main process
+    if is_main:
+        print(f"\n💾 Saving LoRA adapter: {output_dir}")
+        trainer.save_model(output_dir)
+        tokenizer.save_pretrained(output_dir)
+
+        # Merge
+        merged_dir = Path(config["merged_output_dir"])
+        merged_dir.mkdir(parents=True, exist_ok=True)
+
+        print(f"💾 Merging and saving to: {merged_dir}")
+
+        # Need to merge on CPU to avoid OOM
+        model = model.cpu()
+        merged_model = model.merge_and_unload()
+        merged_model.save_pretrained(merged_dir, safe_serialization=True)
+        tokenizer.save_pretrained(merged_dir)
+
+        print("\n" + "=" * 60)
+        print("✅ TRAINING COMPLETE")
+        print("=" * 60)
+
+        return merged_dir
+
+    return None
 
 
 # =============================================================================
 # Main
 # =============================================================================
 if __name__ == "__main__":
-    model, tokenizer = load_model()
-    run_tests(model, tokenizer)
+    import os
 
-    # Interactive mode
-    print("\n" + "=" * 60)
-    print("INTERACTIVE MODE")
-    print("Type a comment to classify (or 'quit' to exit)")
-    print("=" * 60)
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
 
-    while True:
-        print()
-        text = input("Comment: ").strip()
+    merged_dir = train(CONFIG)
 
-        if text.lower() in ["quit", "exit", "q"]:
-            break
-
-        if not text:
-            continue
-
-        result = classify_text(text, model, tokenizer)
-        print(json.dumps(result, indent=2))
+    if local_rank == 0 and merged_dir:
+        print(f"\n🎉 Done! Model saved to: {merged_dir}")
+        print("\nNext step: Run quantize_to_awq.py to convert to AWQ for vLLM")
