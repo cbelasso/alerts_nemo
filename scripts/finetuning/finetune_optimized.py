@@ -45,10 +45,10 @@ from transformers import (
 CONFIG = {
     # Paths - UPDATE THESE
     "training_data_path": "/home/clyde/workspace/alerts_detection_llama/scripts/finetuning/training_data/alerts_training_20251202_224001.jsonl",
-    "output_dir": "/home/clyde/workspace/alerts_detection_llama/models/alerts-nemo-minimal-lora_2",
-    "merged_output_dir": "/home/clyde/workspace/alerts_detection_llama/models/alerts-nemo-minimal-merged_2",
+    "output_dir": "/home/clyde/workspace/alerts_detection_llama/models/alerts-ministral_8b-minimal-lora",
+    "merged_output_dir": "/home/clyde/workspace/alerts_detection_llama/models/alerts-ministral_8b-minimal-merged",
     # Model
-    "base_model": "mistralai/Mistral-Nemo-Instruct-2407",
+    "base_model": "mistralai/Ministral-8B-Instruct-2410",
     "max_seq_length": 2048,  # Reduced from 4096 - most alerts are short
     # LoRA - slightly reduced for speed
     "lora_r": 16,  # Reduced from 32
@@ -68,7 +68,7 @@ CONFIG = {
     # Validation
     "val_split": 0.02,  # 2% validation
     # SAMPLE SIZE - Set to limit training data
-    "max_train_samples": 50000,  # Use 25K samples (plenty for good results!)
+    "max_train_samples": 35000,  # Use 25K samples (plenty for good results!)
 }
 
 
@@ -118,7 +118,7 @@ def format_minimal(examples: list) -> Dataset:
 # Model Setup
 # =============================================================================
 def setup_model(config: dict):
-    """Load model optimized for multi-GPU training."""
+    """Load model optimized for multi-GPU training - FIXED for CUDA compatibility."""
     import os
 
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -127,11 +127,18 @@ def setup_model(config: dict):
     if is_main:
         print(f"\n🔧 Loading model: {config['base_model']}")
 
-    # 4-bit quantization
+    # Check GPU capability
+    if is_main:
+        capability = torch.cuda.get_device_capability()
+        print(f"📊 GPU Compute Capability: {capability}")
+        if capability[0] < 7:
+            print("⚠️  GPU doesn't support bfloat16, using float16")
+
+    # 4-bit quantization - USE FLOAT16 for compatibility
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_compute_dtype=torch.float16,  # ← FIXED: Use float16
         bnb_4bit_use_double_quant=True,
     )
 
@@ -140,10 +147,10 @@ def setup_model(config: dict):
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
 
-    # Model kwargs - NO flash attention (requires separate install)
+    # Model kwargs - FIXED: Use float16
     model_kwargs = {
         "quantization_config": bnb_config,
-        "torch_dtype": torch.bfloat16,
+        "torch_dtype": torch.float16,  # ← FIXED: Use float16
         "trust_remote_code": True,
         "device_map": {"": local_rank},  # Load to current GPU
     }
@@ -360,23 +367,12 @@ def train(config: dict):
         trainer.save_model(output_dir)
         tokenizer.save_pretrained(output_dir)
 
-        # Merge
-        merged_dir = Path(config["merged_output_dir"])
-        merged_dir.mkdir(parents=True, exist_ok=True)
-
-        print(f"💾 Merging and saving to: {merged_dir}")
-
-        # Need to merge on CPU to avoid OOM
-        model = model.cpu()
-        merged_model = model.merge_and_unload()
-        merged_model.save_pretrained(merged_dir, safe_serialization=True)
-        tokenizer.save_pretrained(merged_dir)
-
         print("\n" + "=" * 60)
         print("✅ TRAINING COMPLETE")
         print("=" * 60)
+        print("\nNext: Run merge_lora.py to merge adapter with base model")
 
-        return merged_dir
+        return output_dir
 
     return None
 
