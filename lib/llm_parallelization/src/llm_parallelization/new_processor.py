@@ -261,31 +261,70 @@ class NewProcessor:
     def _prepare_processes(self) -> None:
         ctx = get_context("spawn")
 
-        for i in range(self.multiplicity):
-            gpu_memory_utilization = min(self.gpu_memory_utilization + i * 0.2, 1.0)
+        if self.tensor_parallel_size > 1:
+            gpu_chunks = [
+                self.gpu_list[i : i + self.tensor_parallel_size]
+                for i in range(0, len(self.gpu_list), self.tensor_parallel_size)
+            ]
+
             print(
-                f"Starting multiplicity round {i + 1} with GPU memory utilization: {gpu_memory_utilization}"
+                f"🔗 Tensor parallelism: Creating {len(gpu_chunks)} model(s) "
+                f"with {self.tensor_parallel_size} GPUs each"
             )
 
-            for gpu_num in self.gpu_list:
-                os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_num)
-                process = ctx.Process(
-                    target=NewProcessor.worker,
-                    args=(
-                        self.llm_kwargs,
-                        gpu_num,
-                        self.task_queue,
-                        self.response_queue,
-                        self.stop_event,
-                        self.load_signal_queue,
-                        i,
-                        self.default_guided_config,
-                    ),
+            for i in range(self.multiplicity):
+                # TODO double check the multiplying factor for each multiplicity
+                gpu_memory_utilization = min(self.gpu_memory_utilization + i * 0.2, 1.0)
+                print(
+                    f"Starting multiplicity round {i + 1} with GPU memory utilization: {gpu_memory_utilization}"
                 )
-                process.start()
-                self.processes.append(process)
 
-            self._wait_for_models_to_load(expected_count=self.num_gpus)
+                for chunk_idx, gpu_chunk in enumerate(gpu_chunks):
+                    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_chunk))
+                    process = ctx.Process(
+                        target=NewProcessor.worker,
+                        args=(
+                            self.llm_kwargs,
+                            gpu_chunk[0],
+                            self.task_queue,
+                            self.response_queue,
+                            self.stop_event,
+                            self.load_signal_queue,
+                            i,
+                            self.default_guided_config,
+                        ),
+                    )
+                    process.start()
+                    self.processes.append(process)
+
+                self._wait_for_models_to_load(expected_count=len(gpu_chunks))
+        else:
+            for i in range(self.multiplicity):
+                # TODO double check the multiplying factor for each multiplicity
+                gpu_memory_utilization = min(self.gpu_memory_utilization + i * 0.2, 1.0)
+                print(
+                    f"Starting multiplicity round {i + 1} with GPU memory utilization: {gpu_memory_utilization}"
+                )
+
+                for gpu_num in self.gpu_list:
+                    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_num)
+                    process = ctx.Process(
+                        target=NewProcessor.worker,
+                        args=(
+                            self.llm_kwargs,
+                            gpu_num,
+                            self.task_queue,
+                            self.response_queue,
+                            self.stop_event,
+                            self.load_signal_queue,
+                            i,
+                            self.default_guided_config,
+                        ),
+                    )
+                    process.start()
+                    self.processes.append(process)
+
+                self._wait_for_models_to_load(expected_count=self.num_gpus)
 
     def _wait_for_models_to_load(self, expected_count, timeout=None):
         start_time = time.time()
