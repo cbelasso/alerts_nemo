@@ -15,6 +15,7 @@ from pathlib import Path
 import time
 from typing import List, Literal, Optional, Tuple
 
+from llm_parallelization.new_processor import NewProcessor
 from llm_parallelization.parallelization import (
     NEMO,
     FlexibleSchemaProcessor,
@@ -33,7 +34,7 @@ CONFIG = {
     # Column configuration
     "text_columns": ["comment"],  # Columns to classify
     # GPU configuration
-    "gpu_list": [0, 1, 2, 3, 4, 5, 6, 7],
+    "gpu_list": [4, 5, 6, 7],
     "gpu_memory_utilization": 0.95,
     "max_model_len": 2048 * 5,
     "multiplicity": 1,
@@ -505,9 +506,9 @@ def run_classification_pipeline(
 
     # Initialize processor
     print(f"\n🔧 Initializing processor with {len(gpu_list)} GPUs...")
-    processor = FlexibleSchemaProcessor(
+    processor = NewProcessor(
         gpu_list=gpu_list,
-        llm=NEMO,
+        llm="Qwen/Qwen2.5-32B-Instruct-AWQ",
         gpu_memory_utilization=gpu_memory_utilization,
         max_model_len=max_model_len,
         multiplicity=multiplicity,

@@ -5,6 +5,7 @@ from pathlib import Path
 import time
 from typing import List, Literal, Optional
 
+from llm_parallelization.new_processor import NewProcessor
 from llm_parallelization.parallelization import (
     LLAMA_33_70B_INSTRUCT,
     NEMO,
@@ -13,17 +14,6 @@ from llm_parallelization.parallelization import (
 )
 import pandas as pd
 from pydantic import BaseModel
-
-model = "nemo_ft"
-batch_size = 250
-times = 10
-
-model_dict = {
-    "nemo": NEMO,
-    "llama70": LLAMA_33_70B_INSTRUCT,
-    "qwen": QWEN_AWQ,
-    "nemo_ft": "/data-fast/data3/clyde/fine_tuning/alert_models/alerts-nemo-awq-pure",
-}
 
 
 # -------------------------------
@@ -169,18 +159,112 @@ def main():
         "/home/clyde/workspace/alerts_detection_llama/scripts/generation/datasets/claude_text_comments.csv"
     )
 
+    model = "qwen_35ft"
+    times = 10
+
     texts = df["comment"].tolist()
 
     texts = texts * times
 
-    processor = FlexibleSchemaProcessor(
-        gpu_list=[4, 5, 6, 7],
-        llm=model_dict[model],
-        gpu_memory_utilization=0.95,
-        tokenizer="mistralai/Mistral-Nemo-Instruct-2407",
-        max_model_len=2048 * 5,
-        multiplicity=1,
-    )
+    model_dict = {
+        "nemo": NEMO,
+        "llama70": LLAMA_33_70B_INSTRUCT,
+        "qwen": QWEN_AWQ,
+        "nemo_ft": "/data-fast/data3/clyde/fine_tuning/alert_models/alerts-nemo-awq-pure",
+        "mistral": "mistralai/Ministral-3-14B-Instruct-2512",
+        "mistral_big": "mistralai/Mistral-Small-3.1-24B-Instruct-2503",
+        "ministral": "mistralai/Ministral-8B-Instruct-2410",
+        "ministral_ft": "/data-fast/data3/clyde/fine_tuning/alert_models/alerts-ministral_8b-awq-native",
+        "llama_ft": "/data-fast/data3/clyde/fine_tuning/alert_models/alerts-llama_3b-awq-native",
+        "qwen_ft": "/data-fast/data3/clyde/fine_tuning/alert_models/alerts-qwen-awq",
+        "qwen_35ft": "/data-fast/data3/clyde/fine_tuning/alert_models/alerts-qwen_32b-awq",
+    }
+
+    if model == "nemo_ft":
+        batch_size = 250
+
+        processor = NewProcessor(
+            gpu_list=[4, 5, 6, 7],
+            llm=model_dict[model],
+            gpu_memory_utilization=0.95,
+            tokenizer="mistralai/Mistral-Nemo-Instruct-2407",  # use with nemo_ft
+            max_model_len=2048 * 5,
+            multiplicity=1,
+            enforce_eager=True,
+        )
+
+    elif model == "qwen_35ft":
+        batch_size = 250
+
+        processor = NewProcessor(
+            gpu_list=[4, 5, 6, 7],
+            llm=model_dict[model],
+            gpu_memory_utilization=0.95,
+            tokenizer="Qwen/Qwen2.5-32B-Instruct",  # use with nemo_ft
+            max_model_len=2048,
+            multiplicity=1,
+            enforce_eager=True,
+        )
+
+    elif model == "llama_ft":
+        batch_size = 250
+
+        processor = NewProcessor(
+            gpu_list=[4, 5, 6, 7],
+            llm=model_dict[model],
+            gpu_memory_utilization=0.95,
+            tokenizer="meta-llama/Llama-3.2-3B-Instruct",  # use with nemo_ft
+            max_model_len=2048,
+            multiplicity=1,
+            enforce_eager=True,
+        )
+
+    elif model == "ministral_ft":
+        batch_size = 250
+
+        processor = NewProcessor(
+            gpu_list=[4, 5, 6, 7],
+            llm=model_dict[model],
+            gpu_memory_utilization=0.95,
+            tokenizer="mistralai/Ministral-8B-Instruct-2410",  # use with nemo_ft
+            max_model_len=2048,
+            multiplicity=1,
+            enforce_eager=True,
+        )
+
+    elif model == "mistral_big":
+        batch_size = 25
+        processor = NewProcessor(
+            gpu_list=[4, 5, 6, 7],
+            llm=model_dict[model],
+            gpu_memory_utilization=0.95,
+            # tokenizer="mistralai/Mistral-Nemo-Instruct-2407", #use with nemo_ft
+            tokenizer_mode="mistral",
+            config_format="mistral",
+            load_format="mistral",
+            skip_tokenizer_init=True,  # Don't try to load tokenizer externally
+            max_model_len=2048 * 5,
+            multiplicity=1,
+            enforce_eager=True,
+            tensor_parallel_size=2,
+        )
+
+    else:
+        batch_size = 25
+
+        processor = NewProcessor(
+            gpu_list=[4, 5, 6, 7],
+            llm=model_dict[model],
+            gpu_memory_utilization=0.95,
+            # tokenizer="mistralai/Mistral-Nemo-Instruct-2407", #use with nemo_ft
+            tokenizer_mode="mistral",
+            config_format="mistral",
+            load_format="mistral",
+            skip_tokenizer_init=True,  # Don't try to load tokenizer externally
+            max_model_len=2048 * 5,
+            multiplicity=1,
+            enforce_eager=True,
+        )
 
     try:
         prompts = [create_minimal_prompt(text=text) for text in texts]
