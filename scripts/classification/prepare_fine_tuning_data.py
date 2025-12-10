@@ -213,22 +213,32 @@ Analyze the comment and return ONLY valid JSON."""
 # =============================================================================
 # Training Data Conversion
 # =============================================================================
+# def result_to_training_output(result: AlertsOutput) -> dict:
+#     """Convert a single AlertsOutput to the training output format."""
+#     return {
+#         "has_alerts": result.has_alerts,
+#         "alerts": [
+#             {
+#                 "excerpt": alert.excerpt,
+#                 "alert_type": alert.alert_type,
+#                 "severity": alert.severity,
+#                 "reasoning": alert.reasoning,
+#             }
+#             for alert in result.alerts
+#         ],
+#         "non_alert_classification": result.non_alert_classification,
+#         "non_alert_reasoning": result.non_alert_reasoning,
+#     }
+
+
 def result_to_training_output(result: AlertsOutput) -> dict:
-    """Convert a single AlertsOutput to the training output format."""
-    return {
-        "has_alerts": result.has_alerts,
-        "alerts": [
-            {
-                "excerpt": alert.excerpt,
-                "alert_type": alert.alert_type,
-                "severity": alert.severity,
-                "reasoning": alert.reasoning,
-            }
-            for alert in result.alerts
-        ],
-        "non_alert_classification": result.non_alert_classification,
-        "non_alert_reasoning": result.non_alert_reasoning,
-    }
+    """Convert AlertsOutput to simplified training format - just labels."""
+    if result.has_alerts:
+        alert_types = [alert.alert_type for alert in result.alerts]
+        return {"alert_types": alert_types, "non_alert_types": []}
+    else:
+        non_alert = [result.non_alert_classification] if result.non_alert_classification else []
+        return {"alert_types": [], "non_alert_types": non_alert}
 
 
 def create_training_pairs(
